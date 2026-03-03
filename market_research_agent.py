@@ -13,7 +13,11 @@ Usage:
   python market_research_agent.py --preview    # print report to stdout only
 
 Schedule (cron example - weekly Monday 7am):
-  0 7 * * 1 /usr/bin/python3 /path/to/market_research_agent.py
+  0 7 * * 1 cd /path/to/project && /usr/bin/python3 market_research_agent.py >> logs/agent.log 2>&1
+
+Requires:
+  ANTHROPIC_API_KEY environment variable
+  pip install anthropic>=0.40.0
 """
 
 import argparse
@@ -29,8 +33,12 @@ import anthropic
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 8000
-MAX_TURNS = 20          # safety ceiling for the agentic loop
+MAX_TURNS = 30           # safety ceiling for the agentic loop
+MAX_SEARCH_USES = 12     # hard cap on web searches per run
 REPORTS_DIR = Path("reports")
+
+# Beta header required for web_search_20250305
+BETA_HEADER = "web-search-2025-03-05"
 
 SYSTEM_PROMPT = """
 You are a senior M&A research analyst specialising in the food ingredients and plant
@@ -154,11 +162,21 @@ def run_research_session(verbose: bool = True) -> str:
     """
     Run one full M&A research session using Claude + web_search_20250305.
 
-    The agentic loop:
-      1. Send user prompt.
-      2. If stop_reason == "end_turn"  → extract text and return.
-      3. If stop_reason == "tool_use"  → collect tool_use blocks, send back
-         tool_result acknowledgements, and repeat.
+    web_search_20250305 is a SERVER-SIDE tool — Anthropic's infrastructure
+    executes every search automatically. The stop_reason contract differs from
+    client-side custom tools:
+
+      "pause_turn"  — Server paused after executing one or more web searches.
+                      Search results are already embedded in response.content as
+                      web_search_tool_result blocks. Append the assistant turn
+                      and re-call the API. Do NOT send tool_result messages.
+
+      "end_turn"    — Claude is finished. Extract text and return.
+
+      "tool_use"    — Defensive: handles any client-side tool_use that slips
+                      through (should not occur for web_search in normal use).
+
+      "max_tokens"  — Token ceiling hit mid-response; return partial result.
     """
     client = anthropic.Anthropic()
 
@@ -172,19 +190,43 @@ def run_research_session(verbose: bool = True) -> str:
     for turn in range(1, MAX_TURNS + 1):
         log(f"Turn {turn:02d} — calling API ...", verbose)
 
-        response = client.messages.create(
+        response = client.beta.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             system=SYSTEM_PROMPT,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            tools=[
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": MAX_SEARCH_USES,
+                }
+            ],
             messages=messages,
+            betas=[BETA_HEADER],
         )
 
         stop = response.stop_reason
         log(f"Turn {turn:02d} — stop_reason={stop}", verbose)
 
+        # Log any web searches that fired this turn
+        if verbose:
+            for block in response.content:
+                btype = getattr(block, "type", None)
+                if btype == "tool_use" and getattr(block, "name", "") == "web_search":
+                    query = ""
+                    if hasattr(block, "input") and isinstance(block.input, dict):
+                        query = block.input.get("query", "")
+                    log(f'  → web_search("{query[:80]}")', verbose)
+
         # Add assistant turn to history
         messages.append({"role": "assistant", "content": response.content})
+
+        # ── Server paused after executing searches — just re-call ─────────
+        if stop == "pause_turn":
+            # Search results are already in response.content (injected by the
+            # server). Do NOT add a tool_result user message — that would cause
+            # a 400 error. Simply re-call the API so Claude can continue.
+            continue
 
         # ── Done ──────────────────────────────────────────────────────────
         if stop == "end_turn":
@@ -192,42 +234,38 @@ def run_research_session(verbose: bool = True) -> str:
             log(f"Research complete after {turn} turn(s).", verbose)
             return result
 
-        # ── Tool use (web search) ─────────────────────────────────────────
+        # ── Token ceiling ─────────────────────────────────────────────────
+        if stop == "max_tokens":
+            log("Warning: max_tokens reached — returning partial result.", verbose)
+            return extract_text(response.content) or "[INCOMPLETE: max_tokens reached]"
+
+        # ── Defensive: client-side tool_use (should not fire for web_search) ─
         if stop == "tool_use":
             tool_results = []
             for block in response.content:
-                btype = getattr(block, "type", None)
-                if btype == "tool_use":
-                    query = ""
-                    if hasattr(block, "input") and isinstance(block.input, dict):
-                        query = block.input.get("query", "")
-                    log(f'  → web_search("{query[:80]}")', verbose)
-                    # For web_search_20250305 the search is executed server-side by
-                    # Anthropic. We acknowledge the tool call so the loop continues;
-                    # actual search results are injected by the API infrastructure.
+                if getattr(block, "type", None) == "tool_use":
                     tool_results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": block.id,
-                            "content": "Search executed.",
+                            "content": "[Tool not available client-side]",
+                            "is_error": True,
                         }
                     )
-
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
             continue
 
-        # ── Unexpected stop reason ────────────────────────────────────────
-        log(f"Unexpected stop_reason='{stop}' — breaking loop.", verbose)
+        # ── Unknown stop reason ───────────────────────────────────────────
+        log(f"Unexpected stop_reason='{stop}' — stopping loop.", verbose)
         break
 
     # Fallback: return whatever text is in the last assistant message
     log("Warning: reached max turns — returning partial result.", verbose)
     for msg in reversed(messages):
         if msg["role"] == "assistant":
-            text = extract_text(
-                msg["content"] if isinstance(msg["content"], list) else []
-            )
+            content = msg["content"]
+            text = extract_text(content if isinstance(content, list) else [])
             if text:
                 return text
     return ""
